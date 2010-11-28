@@ -17,35 +17,25 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
-from sys import stderr, exit
+import sys
 import string
 import re
-from xmlrpclib import *
-import httplib, mimetypes
+import xmlrpclib
+import xml.dom.minidom
+import httplib
 import hashlib
 import os
-from os import path
 from log import log
+import getpass
 
+# sm-photo-tool version:  (XXX unused?)
 version = "1.16"
 # sm_photo_tool offical key:
 key = "4XHW8Aw7BQqbkGszuFciGZH4hMynnOxJ"
 
 def error(string):
-    from sys import exit, stderr
-    stderr.write(string + "\n")
-    exit(1)
-
-#def progress(opts, string):
-#    cur = 1
-#    while cur < 10:
-#        time.sleep(0.25)
-#        stdout.write("#")
-#        stdout.flush()
-#        cur += 1
-#
-#    stdout.write("\n")
-#    stdout.flush()
+    sys.stderr.write(string + "\n")
+    sys.exit(1)
 
 def message(opts, string):
     from sys import stdout
@@ -82,37 +72,37 @@ def filename_put_string(filename, string):
 class LocalInformation:
     def __init__(self, dir):
         self.dir = dir
-        self.smdir = path.join(dir, "SMUGMUG_INFO")
+        self.smdir = os.path.join(dir, "SMUGMUG_INFO")
 
     def exists(self):
-        return path.isdir(self.smdir) and \
-            path.isfile(path.join(self.smdir, "gallery"))
+        return os.path.isdir(self.smdir) and \
+            os.path.isfile(os.path.join(self.smdir, "gallery"))
 
     def create(self, gallery):
-        if not path.isdir(self.smdir):
+        if not os.path.isdir(self.smdir):
             os.mkdir(self.smdir)
-        gallery_file = path.join(self.smdir, "gallery")
-        if not path.isfile(gallery_file):
+        gallery_file = os.path.join(self.smdir, "gallery")
+        if not os.path.isfile(gallery_file):
             filename_put_string(gallery_file, "%s\n" % gallery)
         self.created = True
 
     def gallery_id(self):
         if not self.exists():
-            raise "No Localinformation for %s" % (dir)
-        l = filename_get_line(path.join(self.smdir, "gallery"))
+            raise "No LocalInformation for %s" % (dir)
+        l = filename_get_line(os.path.join(self.smdir, "gallery"))
         return l
 
     def file_needs_upload(self, filename):
         try:
             if not self.exists():
                 return False
-            head, tail = path.split(filename)
-            infofile = path.join(self.smdir, tail)
-            if not path.isfile(infofile):
+            head, tail = os.path.split(filename)
+            infofile = os.path.join(self.smdir, tail)
+            if not os.path.isfile(infofile):
                 return True
             l = filename_get_line(infofile)
             utime_s, size_s, count_s = string.split(l)
-            if path.getmtime(filename) > int(utime_s):
+            if os.path.getmtime(filename) > int(utime_s):
                 return True
             if os.stat(filename).st_size != int(size_s):
                 return True
@@ -123,10 +113,10 @@ class LocalInformation:
     def file_uploaded(self, filename):
         from time import time
 
-        head, tail = path.split(filename)
-        infofile = path.join(self.smdir, tail)
+        head, tail = os.path.split(filename)
+        infofile = os.path.join(self.smdir, tail)
 
-        if not path.isfile(infofile):
+        if not os.path.isfile(infofile):
             count = 1
         else:
             l = filename_get_line(infofile)
@@ -140,10 +130,10 @@ class LocalInformation:
             os.stat(filename).st_size, count))
 
     def file_upload_count(self, filename):
-        head, tail = path.split(filename)
-        infofile = path.join(self.smdir, tail)
+        head, tail = os.path.split(filename)
+        infofile = os.path.join(self.smdir, tail)
 
-        if not path.isfile(infofile):
+        if not os.path.isfile(infofile):
             return 0
         else:
             l = filename_get_line(infofile)
@@ -159,41 +149,179 @@ class LocalInformation:
 # Alternatively, instead of doing captioning through this tool, once
 # an image is uploaded to smugmug, the smugmug system will use the
 # "IPTC:Caption-Abstract" EXIF header field as a default caption.
-# (Try 'exiftool -Caption-Abstract="this is a test caption" foo.jpg.)
+# (Try 'exiftool -Caption-Abstract="this is a test caption" foo.jpg'.)
 #
 def caption(filename, filenames_default_captions):
-    head, ext = path.splitext(filename)
+    head, ext = os.path.splitext(filename)
     capfile = head + ".caption"
-    if path.isfile(capfile):
+    if os.path.isfile(capfile):
         result = filename_get_data(capfile)
         return result
     if filenames_default_captions:
-        head, tail = path.split(head)
+        head, tail = os.path.split(head)
         return tail
     return None
 
 def get_content_type(filename):
     return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
+#
+# Create a 'cookie-aware' transport for XMLRPC lib to use instead of
+# its default 'SafeTransport'
+#
+class XmlRpcCookieTransport(xmlrpclib.SafeTransport):
+    '''
+    Adds to request all cookies from previous request
+    '''
+
+    #user_agent = "sm-tool xmlrpclib/%s" % __version__ 
+
+    def __init__(self):
+        xmlrpclib.SafeTransport.__init__(self)
+        self._cookies = None
+
+    def request(self,
+                host,
+                handler,
+                request_body,
+                verbose=False):
+        """
+        Replace xmlrcplib.Transport's 'request' method.  Re-implement
+        it to cache SmugMug's special session Cookies.
+        """
+
+        # Connect (using SSL):
+        h = self.make_connection(host)
+        if verbose:
+            print "CookieTransport single_request(%s)" % str(request_body)
+            h.set_debuglevel(1)
+
+        try:
+            # Compose the request
+            self.send_request(h, handler, request_body)
+            self.send_host(h, host)
+            self.send_user_agent(h)
+
+            # Add any cookies that have been cached
+            if self._cookies:
+                for c in self._cookies:
+                    h.putheader("Cookie", c)
+                
+            self.send_content(h, request_body)
+
+            # Get the reply
+            errcode, errmsg, headers = h.getreply()
+
+            # Any HTTP error causes us to just bail here
+            if errcode != 200:
+                raise ProtocolError(
+                    host + handler,
+                    errcode, errmsg,
+                    headers 
+                   )
+
+            # Save off any cookies received
+            cookies = headers['set-cookie']
+
+            #
+            # XXX cookie mashing.  RFC2616 states that HTTP header
+            # messages must not change semantics when concatenated
+            # with a ','.  However, SmugMug is including bits like
+            # "expires=Tue, 28-Dec-2010 06:46:11 GMT;" in the cookie
+            # value.  So, we first replace the date-like expiration
+            # commas with '%2C', then split the string on commas.
+            # Ugh.
+            #
+            # This wouldn't be an issue if the Python http libraries
+            # just returned a list of Set-Cookie headers instead of a
+            # single comma-joined string.
+            #
+
+            assert not '%2C' in cookies # need a more unique string if so ...
+
+            # Fix embedded commas
+            (cookies, fixCt) = re.subn(r'expires=(...),',
+                                       r'expires=\1%2C', cookies)
+
+            self._cookies = []
+            for c in cookies.split(","):
+                c = c.lstrip()
+                # ONLY keep the "_su" cookie.  Smugmug rejects you
+                # otherwise.  (I think this is just the "HttpOnly"
+                # property I'm implementing?  This is good enough for
+                # now ...)
+                if c.startswith("_su"):
+                    self._cookies.append(c.lstrip().replace('%2C', ','))
+
+            self.verbose = verbose
+            return self.parse_response(h.getfile())
+
+        except xmlrpclib.Fault:
+            raise
+            
+        except Exception:
+            # All unexpected errors leave connection in
+            # a strange state, so we clear it.
+            h.close()
+            raise
+            
+
+class SmugmugException(Exception):
+    def __init__(self, value, code=0):
+        self.code = code
+        self.value = value
+
+    def __str__(self):
+        return repr(self.value)
+
 class Smugmug:
     def __init__(self, account, passwd):
-        self.account = account
-        self.password = passwd
-        self.sp = ServerProxy(
-            "https://api.smugmug.com/services/api/xmlrpc/1.2.1/")
         self.categories = None
         self.subcategories = None
+        self.session = None
+
+        if not account:
+            raise RuntimeError, "Must provide a valid login (via dot-file or --login option)"
+        if not passwd:
+            raise RuntimeError, "Must provide a valid password (via dot-file or --password option)"
+
+        # XXX
+        #xmlrpcVerbose = True
+        xmlrpcVerbose = False
+
+        self.account = account
+        if passwd is None:
+            passwd = getpass.getpass()
+        self.password = passwd
+
+        # XXX v1.2.2 doesn't have 'login.withPassword' ..
+        self.sp = xmlrpclib.ServerProxy(
+            "https://api.smugmug.com/services/api/xmlrpc/1.2.1/",
+            transport=XmlRpcCookieTransport(),
+            verbose=xmlrpcVerbose)
+
         self.login()
 
     def __del__(self):
         self.logout()
 
     def login(self):
-        rc = self.sp.smugmug.login.withPassword(self.account, self.password, key)
-        self.session = rc["Session"]["id"]
+        try:
+            rc = self.sp.smugmug.login.withPassword(self.account, self.password, key)
+            self.session = rc["Session"]["id"]
+        except xmlrpclib.Fault, err:
+            raise SmugmugException(err.faultString, err.faultCode)
+
+        log.debug("Logged in. Session: %s" % (str(self.session)))
 
     def logout(self):
-        self.sp.smugmug.logout(self.session)
+        try:
+            if self.session:
+                self.sp.smugmug.logout(self.session)
+        except xmlrpclib.Fault, err:
+            # only raise the error if it is not an invalid session
+            if not err.faultCode == 3: # 3 == invalid session
+                raise SmugmugException(err.faultString, err.faultCode)
 
     def _set_property(self, props, name, opt):
         if opt != None:
@@ -223,6 +351,11 @@ class Smugmug:
             self._set_property(props, "Printable", opts.print_ordering_allowed)
             self._set_property(props, "Originals", opts.originals_allowed)
             self._set_property(props, "CommunityID", opts.community)
+            self._set_property(props, "WorldSearchable", opts.world_searchable)
+            self._set_property(props, "SmugSearchable", opts.smug_searchable)
+            self._set_property(props, "SquareThumbs", opts.square_thumbs)
+            self._set_property(props, "HideOwner", opts.hide_owner)
+            self._set_property(props, "SortMethod", opts.sort_method)
 
         rsp = self.sp.smugmug.albums.create(self.session, name, category, props)
         return rsp['Album']['id']
@@ -235,7 +368,7 @@ class Smugmug:
 
     def get_category(self, category_string):
         if re.match("\d+$", category_string):
-            return string.atoi(category_string)
+            return int(category_string)
         if not self.categories:
             self.get_categories()
 
@@ -246,15 +379,15 @@ class Smugmug:
 
     def get_subcategory(self, category, subcategory_string):
         if re.match("\d+$", subcategory_string):
-            return string.atoi(subcategory_string)
+            return int(subcategory_string)
         if not self.subcategories:
             self.subcategories = {}
         if not self.subcategories.has_key(category):
             subcategories = self.sp.smugmug.subcategories.get(
                 self.session, category)
             subcategory_map = {}
-            for subcategory in subcategories:
-                subcategory_map[subcategory['Title']] = subcategory['SubCategoryID']
+            for subcategory in subcategories['SubCategories']:
+                subcategory_map[subcategory['Name']] = subcategory['id']
             self.subcategories[category] = subcategory_map
 
         if not self.subcategories[category].has_key(subcategory_string):
@@ -265,15 +398,14 @@ class Smugmug:
     def upload_files(self, albumid, opts, args, local_information=None):
         from time import time
         from os import stat
-        from string import atoi
 
-        max_size = atoi(opts.max_size)
+        max_size = opts.max_size
 
         total_size = 0
         sizes = {}
         files = []
         for file in args:
-            if not path.isfile(file):
+            if not os.path.isfile(file):
                 message(opts,"%s is not a file. Not uploading.\n" % file)
                 continue
             size = stat(file).st_size
@@ -329,8 +461,11 @@ class Smugmug:
             imgKey = imgHandle['Key']
             resp = self.sp.smugmug.images.getInfo(self.session, imgID, imgKey)
             img = resp['Image']
+            fn = '<unnamed>'
+            if 'FileName' in img:
+                fn = img['FileName']
             message(opts, "%d: %s (%d x %d):%s\n" %
-                (imgID, img['FileName'], img['Width'], img['Height'],
+                (imgID, fn, img['Width'], img['Height'],
                  img['Caption']))
 
     # List all the albums/galleries the current user has
@@ -339,8 +474,14 @@ class Smugmug:
         resp = self.sp.smugmug.albums.get(self.session)
         albums = resp['Albums']
 
+        albById={}
         for alb in albums:
-            message(opts, "%9d: %s\n" % (alb['id'], alb['Title']))
+            id = alb['id']
+            albById[id] = alb
+
+        for id in sorted(albById.keys()):
+            alb = albById[id]
+            message(opts, "%9d: %s\n" % (id, alb['Title']))
 
     def upload_file(self, albumid, filename, caption=None):
         data = filename_get_data(filename)
@@ -359,11 +500,53 @@ class Smugmug:
         if caption:
             h.putheader('X-Smug-Caption', caption)
         h.endheaders()
+        log.debug("PUT: header: %s" % str(h))
+
         h.send(data)
 
         # response output
         resp = h.getresponse()
         log.debug("%s: %s" % (resp.status, resp.reason))
-        result = resp.read()
+        resultStr = resp.read()
         h.close()
-        log.debug("PUT: result: %s" % result)
+        log.debug("PUT: result: %s" % resultStr)
+
+        #Method response looks like this:
+        # <methodResponse>
+        # <fault>
+        # <value>
+        #  <struct>
+        #   <member>
+        #    <name>method</name>
+        #    <value>
+        #     <string>smugmug.images.upload</string>
+        #    </value>
+        #   </member>
+        #   <member>
+        #    <name>faultCode</name>
+        #    <value>
+        #     <int>5</int>
+        #    </value>
+        #   </member>
+        #   <member>
+        #    <name>faultString</name>
+        #    <value>
+        #     <string>system error (invalid album id)</string>
+        #    </value>
+        #   </member>
+        #  </struct>
+        # </value>
+        # </fault>
+        # </methodResponse> (__init__/1091)
+        # 
+
+        resultObj = xml.dom.minidom.parseString(resultStr)
+        root = resultObj.documentElement
+        if root.tagName == "methodResponse":
+            print "Got a 'methodResponse'", str(root)
+
+        faults = root.getElementsByTagName("fault")
+        if faults:
+            print "Has Fault?", faults
+
+        resultObj.unlink()

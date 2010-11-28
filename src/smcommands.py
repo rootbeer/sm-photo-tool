@@ -18,7 +18,7 @@
 
 import sys
 from optparse import OptionParser
-from sm_wrapper import Smugmug, LocalInformation
+from sm_wrapper import Smugmug, LocalInformation, SmugmugException
 import sm_wrapper
 from os import environ, path
 import os
@@ -49,11 +49,12 @@ class CliCommand(object):
         self.parser = OptionParser(usage=usage, description=description)
         self._add_common_options()
         self.name = name
+        self.smugmug = None
 
     def _load_defaults_from_rc(self, options):
         config = Config('/etc/sm-photo-tool/sm.conf', '.smugmugrc')
         for (k,v) in config.get_as_dict().items():
-            # if config overrides an options default value, use it.
+            # if config overrides an option's default value, use it.
             # if the option was passed in use it to override config.
             _set_option(options, self.parser, k, v)
 
@@ -68,7 +69,7 @@ class CliCommand(object):
         self.parser.add_option("--log", dest="log_file", metavar="FILENAME",
                 help="log file name (will be overwritten)")
         self.parser.add_option("--log-level", dest="log_level",
-                default="critical", metavar="LEvEL",
+                default="critical", metavar="LEVEL",
                 help="log level (debug/info/warning/error/critical)")
 
     def _validate_options(self):
@@ -80,22 +81,35 @@ class CliCommand(object):
     def get_name(self):
         return self.name
 
+    def print_help(self, message=None, exit_code=11):
+        if message:
+            print "ERROR:", message
+        self.parser.print_help()
+        sys.exit(exit_code)
+
     def main(self):
         (self.options, self.args) = self.parser.parse_args()
+
+        self._load_defaults_from_rc(self.options)
 
         # Setup logging, this must happen early!
         setup_logging(self.options.log_file, self.options.log_level)
         log.debug("Running cli commands: %s" % self.name)
 
-        self._load_defaults_from_rc(self.options)
-
         self._validate_options()
 
         if len(sys.argv) < 2:
-            print(parser.error("Please enter at least 2 args"))
+            self.parser.error("Please enter at least 2 args")
 
-        # do the work
-        self._do_command()
+        try:
+            # connect to smugmug.com
+            self.smugmug = Smugmug(self.options.login, self.options.password)
+
+            # do the work
+            self._do_command()
+        except SmugmugException, e:
+            print(e.value)
+            sys.exit(1)
 
     def _get_defaults(self):
         pass
@@ -126,6 +140,14 @@ class CreateCommand(CliCommand):
         self.parser.add_option("--showfilenames", dest="show_filenames",
                 action="store_true", 
                 help="show filenames in the gallery, [default: %default]")
+        self.parser.add_option("--squarethumbs", dest="square_thumbs",
+                action="store_true",
+                help="square thumbs in the gallery, [default: %default]")
+        self.parser.add_option("--hideowner", dest="hide_owner",
+                action="store_true",
+                help="hide ownership, [default: %default]")
+        self.parser.add_option("--sortmethod", dest="sort_method",
+                help="define sort method, [default: %default]")
         self.parser.add_option("--no-comments", dest="comments_allowed",
                 action="store_false", 
                 help="disallow comments")
@@ -142,6 +164,10 @@ class CreateCommand(CliCommand):
                 help="disable print ordering")
         self.parser.add_option("--no-originals", dest="originals_allowed",
                 action="store_false",  help="disallow originals")
+        self.parser.add_option("--no-world-searchable", dest="world_searchable",
+                action="store_false",  help="disallow world searchability")
+        self.parser.add_option("--no-smug-searchable", dest="smug_searchable",
+                action="store_false",  help="disallow smug searchability")
         self.parser.add_option("--community", dest="community",
                 metavar="COMMUNITY", help="specifies the gallery's community")
         self.parser.add_option("--filter-regex",
@@ -150,7 +176,16 @@ class CreateCommand(CliCommand):
         self.parser.add_option("--upload", dest="upload",
                 action="store_true",  
                 help="upload images, ignoring previous upload state")
+        self.parser.add_option("--max_size", dest="max_size",
+                metavar="MAX_SIZE", type="int",
+                help="Maximum file size (bytes) to upload. [default: %default]")
+        self.parser.add_option("--filenames_default_captions",
+                dest="filenames_default_captions",
+                action="store_true", 
+                help="Filenames should be used as the default caption.")
 
+        self.parser.set_defaults(max_size=800000000)
+        self.parser.set_defaults(filenames_default_captions=False)
         self.parser.set_defaults(public=True)
         self.parser.set_defaults(show_filenames=False)
         self.parser.set_defaults(comments_allowed=True)
@@ -160,7 +195,9 @@ class CreateCommand(CliCommand):
         self.parser.set_defaults(print_ordering_allowed=True)
         self.parser.set_defaults(originals_allowed=True)
         self.parser.set_defaults(upload=False)
-        self.parser.set_defaults(filter_regex =".*\\.(jpg|gif|avi|JPG|GIF|AVI)")
+        self.parser.set_defaults(filter_regex =".*\\.(jpg|gif|avi|m4v|mp4|JPG|GIF|AVI|M4V|MP4)")
+        self.parser.set_defaults(max_size=800000000)
+        self.parser.set_defaults(sort_method="Position")
 
     def _process_files(self, local, files):
         files_to_upload = []
@@ -174,8 +211,6 @@ class CreateCommand(CliCommand):
         return files_to_upload
 
     def _do_command(self):
-        # connect to smugmug.com
-        self.smugmug = Smugmug(self.options.login, self.options.password)
         name = self.args[1]
         # TODO: get options to album from CLI
         album_id = self.smugmug.create_album(name, self.options)
@@ -200,13 +235,14 @@ class CreateCommand(CliCommand):
 
     def _validate_options(self):
         if len(self.args) < 2:
-            print("ERROR: requires album name")
+            self.print_help(message="missing required album name",
+                            exit_code=87)
             sys.exit(1)
 
 class UpdateCommand(CliCommand):
     def __init__(self):
         usage = "usage: %prog update [options]"
-        shortdesc = "Updates gallery with any new or modified images."
+        shortdesc = "Updates current gallery with any new or modified images."
         description = "Updates the gallery associated with the current " + \
             "working directory with any new or modified images."
         CliCommand.__init__(self, "update", usage, shortdesc, description)
@@ -215,7 +251,7 @@ class UpdateCommand(CliCommand):
                 dest="filter_regex", metavar="REGEX",
                 help="Only upload files that match. [default: %default]")
 
-        self.parser.set_defaults(filter_regex =".*\\.(jpg|gif|avi|JPG|GIF|AVI)")
+        self.parser.set_defaults(filter_regex =".*\\.(jpg|png|gif|avi|m4v|mp4|JPG|PNG|GIF|AVI|M4V|MP4)")
 
     def _process_files(self, local, files):
         files_to_upload = []
@@ -229,14 +265,17 @@ class UpdateCommand(CliCommand):
         return files_to_upload
 
     def _do_command(self):
-        # connect to smugmug.com
-        self.smugmug = Smugmug(self.options.login, self.options.password)
 
         li = LocalInformation(".")
+        if not li.exists():
+            print "No gallery assicated with current directory.  Nothing to update."
+            sys.exit(47)
+
         to_upload = self._process_files(li, os.listdir("."))
         if len(to_upload) > 0:
             self.smugmug.upload_files(li.gallery_id(), self.options,
                 to_upload, local_information=li)
+
 
 class FullUpdateCommand(CliCommand):
     def __init__(self):
@@ -304,7 +343,7 @@ class FullUpdateCommand(CliCommand):
         self.parser.set_defaults(print_ordering_allowed=True)
         self.parser.set_defaults(originals_allowed=True)
         self.parser.set_defaults(upload=False)
-        self.parser.set_defaults(filter_regex =".*\\.(jpg|gif|avi|JPG|GIF|AVI)")
+        self.parser.set_defaults(filter_regex =".*\\.(jpg|gif|avi|m4v|mp4|JPG|GIF|AVI|M4V|MP4)")
 
     def _process_files(self, local, files):
         files_to_upload = []
@@ -318,8 +357,6 @@ class FullUpdateCommand(CliCommand):
         return files_to_upload
 
     def _do_command(self):
-        # connect to smugmug.com
-        self.smugmug = Smugmug(self.options.login, self.options.password)
         album_id = None
 
         for root, dirs, files in os.walk("."):
@@ -349,12 +386,14 @@ class FullUpdateCommand(CliCommand):
 
 class UploadCommand(CliCommand):
     def __init__(self):
-        usage = "usage: %prog upload <gallery_id> [options] <file...>"
+        usage = "usage: %prog upload [options] <gallery_id> <file...>"
         shortdesc = "Upload the given files to the given gallery_id."
-        desc = "Simply upload the listed files to the gallery with the " + \
-            "given gallery_id. Unlike the above command, does not " + \
-            "require or update any local information."
+        desc = "Upload the listed file(s) to the gallery with the " + \
+            "given gallery_id. Unlike 'update' or 'full_update' commands, " + \
+            "does not require or update any local information."
         CliCommand.__init__(self, "upload", usage, shortdesc, desc)
+
+        # XXX  share options with 'CreateCommand'? (i.e., upload --create?)
 
         self.parser.add_option("--max_size", dest="max_size",
                 metavar="MAX_SIZE", type="int",
@@ -367,26 +406,26 @@ class UploadCommand(CliCommand):
         self.parser.set_defaults(max_size=800000000)
         self.parser.set_defaults(filenames_default_captions=False)
 
+
     def _do_command(self):
         album_id = self.args[1]
         files = self.args[2:]
-        # connect to smugmug.com
-        self.smugmug = Smugmug(self.options.login, self.options.password)
         self.smugmug.upload_files(album_id, self.options, files)
+
 
     def _validate_options(self):
         if len(self.args) < 3:
-            print("ERROR: requires album_id and filenames.")
-            sys.exit(1)
+            self.print_help(message="insufficient arguments",
+                            exit_code=31)
 
 class ListCommand(CliCommand):
     """ List commands """
 
     def __init__(self):
-        usage = "usage: %prog list <album [albumid] | galleries>"
+        usage = "usage: %prog list [options] <album [albumid] | galleries>"
         desc = "Lists the files in an album, or lists available galleries"
         CliCommand.__init__(self, "list", usage, desc)
-        self.valid_options = ["album", "galleries"]
+        self.valid_options = ["album", "gallery", "galleries"]
 
         # add the list options here
         #self.parser.add_option("--album", dest="album", metavar="ALBUM",
@@ -397,31 +436,33 @@ class ListCommand(CliCommand):
     def _do_command(self):
         # do the list work
 
-        # connect to smugmug.com
-        self.smugmug = Smugmug(self.options.login, self.options.password)
 
         cmd = self.args[1]
         if len(self.args) > 2:
             id = self.args[2]
 
-        if cmd == "album":
-            self.smugmug.list_files(id, None, None)
+        if cmd == "album" or cmd == "gallery":
+            albumid = self.args[2]
+            self.smugmug.list_files(albumid, None, None)
         elif cmd == "galleries":
             self.smugmug.list_galleries(None, None)
         else:
-            # bail
-            sys.exit(1)
+            raise Exception, "Unexpected command %s" % cmd
 
     def _validate_options(self):
         if len(self.args) < 2:
-            print(self.parser.print_help())
-            sys.exit(1)
+            self.print_help(message="insufficient arguments",
+                            exit_code=13)
 
-        if len(self.args) < 3:
-            if self.args[1] != "galleries":
-                print("ERROR: requires album or galleries")
-                sys.exit(1)
+        cmd = self.args[1]
 
-        if self.args[1] not in self.valid_options:
-            print("ERROR: valid options are %s" % self.valid_options)
-            sys.exit(1)
+        if cmd not in self.valid_options:
+            m="Unrecognized command '%s'.  Should be one of %s" % (cmd, ','.join(self.valid_options))
+            self.print_help(message=m, exit_code=15)
+
+        if cmd == "album":
+            if len(self.args) < 3:
+                m="album command requires an 'albumid'"
+                self.print_help(message=m, exit_code=14)
+
+        # other commands have no specializations

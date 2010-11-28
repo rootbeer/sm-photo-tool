@@ -33,20 +33,33 @@ class CLI:
                     self.cli_commands[cmd.get_name()] = cmd 
 
     def _add_command(self, cmd):
+        """adds a command module to the registered list """
         self.cli_commands[cmd.get_name()] = cmd
         
-    def _usage(self):
-        print("\nUsage: %s [options] MODULENAME --help\n" %
+    def _usage(self, exit_code=0):
+        """print out the usage"""
+        print("\nUsage: %s MODULENAME [options]\n" %
             (os.path.basename(sys.argv[0])))
-        print("Supported modules:\n")
+        print("Supported COMMANDs:\n")
         for (name, cmd) in self.cli_commands.items():
             print("\t%-14s %-25s" % (name, cmd.shortdesc))
         print("")
+        sys.exit(exit_code)
 
     def main(self):
-        if len(sys.argv) < 2 or not self.cli_commands.has_key(sys.argv[1]):
-            self._usage()
-            sys.exit(1)
+        if len(sys.argv) < 2:
+            self._usage(exit_code=0)
+
+        if sys.argv[1] in ["help", "--help", "-h", "-help"]:
+            if len(sys.argv) > 2:
+                # XXX "help foo" should show foo's help ...
+                pass
+            self._usage(exit_code=0)
+
+        if not self.cli_commands.has_key(sys.argv[1]):
+            print "ERROR: invalid command", sys.argv[1]
+            self._usage(exit_code=37)
 
         cmd = self.cli_commands[sys.argv[1]]
         cmd.main()
+        sys.exit(0)
