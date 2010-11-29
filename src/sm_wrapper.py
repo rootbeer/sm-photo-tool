@@ -23,6 +23,8 @@ import re
 import xmlrpclib
 import xml.dom.minidom
 import httplib
+import cookielib
+import Cookie
 import hashlib
 import os
 from log import log
@@ -31,7 +33,7 @@ import getpass
 # sm-photo-tool version:  (XXX unused?)
 version = "1.16"
 # sm_photo_tool offical key:
-key = "4XHW8Aw7BQqbkGszuFciGZH4hMynnOxJ"
+API_KEY = "4XHW8Aw7BQqbkGszuFciGZH4hMynnOxJ"
 
 def error(string):
     sys.stderr.write(string + "\n")
@@ -174,11 +176,11 @@ class XmlRpcCookieTransport(xmlrpclib.SafeTransport):
     Adds to request all cookies from previous request
     '''
 
-    #user_agent = "sm-tool xmlrpclib/%s" % __version__ 
+    user_agent = "sm-photo-tool/%s" % version
 
     def __init__(self):
         xmlrpclib.SafeTransport.__init__(self)
-        self._cookies = None
+        self._cookies = {}
 
     def request(self,
                 host,
@@ -193,7 +195,6 @@ class XmlRpcCookieTransport(xmlrpclib.SafeTransport):
         # Connect (using SSL):
         h = self.make_connection(host)
         if verbose:
-            print "CookieTransport single_request(%s)" % str(request_body)
             h.set_debuglevel(1)
 
         try:
@@ -202,11 +203,17 @@ class XmlRpcCookieTransport(xmlrpclib.SafeTransport):
             self.send_host(h, host)
             self.send_user_agent(h)
 
+            # XXX factor out cookie-header-string
             # Add any cookies that have been cached
-            if self._cookies:
-                for c in self._cookies:
-                    h.putheader("Cookie", c)
+            cookieStrs=[]
+            for c in self._cookies.keys():
+                cstr = "%s=%s" % (c, self._cookies[c]) # XXX encode cookies?
+                cookieStrs.append(cstr)
                 
+            if cookieStrs:
+                # Append a single "Cookie" header will all of the cookies
+                h.putheader("Cookie", ";".join(cookieStrs))
+
             self.send_content(h, request_body)
 
             # Get the reply
@@ -220,43 +227,59 @@ class XmlRpcCookieTransport(xmlrpclib.SafeTransport):
                     headers 
                    )
 
+            # XXX factor out header-scraping-cookie-updating
             # Save off any cookies received
-            cookies = headers['set-cookie']
+            cookies = None
+            if headers.has_key('set-cookie'):
+                cookies = headers['set-cookie']
 
-            #
-            # XXX cookie mashing.  RFC2616 states that HTTP header
-            # messages must not change semantics when concatenated
-            # with a ','.  However, SmugMug is including bits like
-            # "expires=Tue, 28-Dec-2010 06:46:11 GMT;" in the cookie
-            # value.  So, we first replace the date-like expiration
-            # commas with '%2C', then split the string on commas.
-            # Ugh.
-            #
-            # This wouldn't be an issue if the Python http libraries
-            # just returned a list of Set-Cookie headers instead of a
-            # single comma-joined string.
-            #
+            if headers.has_key('set-cookie2'):
+                raise RuntimeError, "Dunno what to do with v2 cookies ..."
 
-            assert not '%2C' in cookies # need a more unique string if so ...
+            if cookies:
+                #
+                # XXX cookie mashing.  RFC2616 states that HTTP header
+                # messages must not change semantics when concatenated
+                # with a ','.  However, the 'expire' attribute
+                # includes text like "expires=Tue, 28-Dec-2010
+                # 06:46:11 GMT;" in the cookie value (note the comma).
+                # So, we first replace the expire date commas with
+                # '%2C', then split the string on commas!
+                #
+                # This wouldn't be an issue if the Python http libraries
+                # just returned a list of Set-Cookie headers instead of a
+                # single comma-joined string.
+                #
+                COMMA_STR = '%2C'
+                assert not COMMA_STR in cookies # need a more unique string if so ...
+                
+                # Fix embedded commas
+                (cookies, fixCt) = re.subn(r'expires=(...),',
+                                           r'expires=\1' + COMMA_STR, cookies)
+                
+                for cstr in cookies.split(","):
+                    cstr = cstr.lstrip().replace(COMMA_STR, ',')
+                
+                    if False:
+                        c = Cookie.BaseCookie(cstr)
+                        # NOTE: c.iterkeys() gives the (single) "key" of the cookie
+                        # NOTE: c["key"].iterkeys() gives the attrs of the cookie
+                        print "COOKIE", str(c)
+                        for k in c.keys():
+                            print "   C:", k  #, c[k]
+                            for attr in c[k].keys():
+                                print "      A:", attr, c[k][attr]
+                                
+                    cookie=cstr.split(';')[0] # strip all the 'flags'
+                    (name, val) = cookie.split("=")
 
-            # Fix embedded commas
-            (cookies, fixCt) = re.subn(r'expires=(...),',
-                                       r'expires=\1%2C', cookies)
-
-            self._cookies = []
-            for c in cookies.split(","):
-                c = c.lstrip()
-                # ONLY keep the "_su" cookie.  Smugmug rejects you
-                # otherwise.  (I think this is just the "HttpOnly"
-                # property I'm implementing?  This is good enough for
-                # now ...)
-                if c.startswith("_su"):
-                    self._cookies.append(c.lstrip().replace('%2C', ','))
+                    self._cookies[name] = val
 
             self.verbose = verbose
             return self.parse_response(h.getfile())
 
         except xmlrpclib.Fault:
+            # Catch xmlrpclib.Fault here just so it doesn't get caught below
             raise
             
         except Exception:
@@ -279,6 +302,7 @@ class Smugmug:
         self.categories = None
         self.subcategories = None
         self.session = None
+        self.transport = XmlRpcCookieTransport()
 
         if not account:
             raise RuntimeError, "Must provide a valid login (via dot-file or --login option)"
@@ -286,7 +310,7 @@ class Smugmug:
             raise RuntimeError, "Must provide a valid password (via dot-file or --password option)"
 
         # XXX
-        #xmlrpcVerbose = True
+        xmlrpcVerbose = True
         xmlrpcVerbose = False
 
         self.account = account
@@ -294,11 +318,19 @@ class Smugmug:
             passwd = getpass.getpass()
         self.password = passwd
 
-        # XXX v1.2.2 doesn't have 'login.withPassword' ..
+        # XXX v1.2.2 doesn't have 'login.withPassword' 
         self.sp = xmlrpclib.ServerProxy(
             "https://api.smugmug.com/services/api/xmlrpc/1.2.1/",
-            transport=XmlRpcCookieTransport(),
+            #"https://secure.smugmug.com/services/api/xmlrpc/1.2.2/",
+            transport=self.transport,
             verbose=xmlrpcVerbose)
+
+        if False:
+            # Use XMLRPC introspection to print all the methods ...
+            print "METHODS:"
+            for m in self.sp.system.listMethods():
+                sig = self.sp.system.methodSignature(m)
+                print m, str(sig)
 
         self.login()
 
@@ -307,11 +339,14 @@ class Smugmug:
 
     def login(self):
         try:
-            rc = self.sp.smugmug.login.withPassword(self.account, self.password, key)
+            # XXX 1.2.2 API:??
+            #rc = self.sp.smugmug.login.withPassword(API_KEY, self.account, self.password)
+            rc = self.sp.smugmug.login.withPassword(self.account, self.password, API_KEY)
             self.session = rc["Session"]["id"]
         except xmlrpclib.Fault, err:
             raise SmugmugException(err.faultString, err.faultCode)
 
+        print "SESSION: ", str(self.session)
         log.debug("Logged in. Session: %s" % (str(self.session)))
 
     def logout(self):
@@ -324,20 +359,50 @@ class Smugmug:
                 raise SmugmugException(err.faultString, err.faultCode)
 
     def _set_property(self, props, name, opt):
-        if opt != None:
+        """
+        Safely set a property, ignoring it if the value is None
+        """
+        if opt is not None:
+            log.debug("Setting album property %s to %s" % (name, str(opt)))
             props[name] = opt
+        else:
+            log.debug("Not setting album property %s" % (name))
+
 
     def create_album(self, name, opts):
         props = {}
 
         if opts != None:
-            if not opts.category or opts.category == '0':
-                category = 0
-            else:
-                category = self.get_category(opts.category)
+            #
+            # Figure out the category and/or sub-category to create
+            # the new album in
+            #
+            catID = 0
+            subcatID = None
+
+            if opts.categoryID:
+                # --category-id is overriden by --category
+                catID = int(opts.categoryID)
+                
+            if opts.category:
+                catID = self.get_category(opts.category)
+
+            if catID != 0:
+                log.debug("Chose catID %u from (%s / %s)" % \
+                          (catID, str(opts.categoryID), opts.category))
+
+                # Only consider the subcategory options if a category
+                # was set
+
+                if opts.subcategoryID:
+                    subcatID = int(opts.subcategoryID)
+
                 if opts.subcategory:
-                    subcat = self.get_subcategory(category, opts.subcategory)
-                    props["SubCategoryID"] = subcat
+                    subcatID = self.get_subcategory(catID, opts.subcategory)
+
+                if subcatID is not None:
+                    log.debug("Chose sub-catID %u from (%s / %s)" % \
+                              (subcatID, str(opts.subcategoryID), opts.subcategory))
 
             self._set_property(props, "Description", opts.description)
             self._set_property(props, "Keywords", opts.keywords)
@@ -356,8 +421,9 @@ class Smugmug:
             self._set_property(props, "SquareThumbs", opts.square_thumbs)
             self._set_property(props, "HideOwner", opts.hide_owner)
             self._set_property(props, "SortMethod", opts.sort_method)
+            self._set_property(props, "SubCategoryID", subcatID)
 
-        rsp = self.sp.smugmug.albums.create(self.session, name, category, props)
+        rsp = self.sp.smugmug.albums.create(self.session, name, catID, props)
         return rsp['Album']['id']
 
     def get_categories(self):
@@ -367,8 +433,10 @@ class Smugmug:
             self.categories[category['Name']] = category['id']
 
     def get_category(self, category_string):
-        if re.match("\d+$", category_string):
-            return int(category_string)
+        """
+        Return the category id for the given category string
+        """
+
         if not self.categories:
             self.get_categories()
 
@@ -378,8 +446,11 @@ class Smugmug:
             return self.categories[category_string]
 
     def get_subcategory(self, category, subcategory_string):
-        if re.match("\d+$", subcategory_string):
-            return int(subcategory_string)
+        """
+        Return the integer subcategory id number for the given
+        subcategory name of the given category.
+        """
+
         if not self.subcategories:
             self.subcategories = {}
         if not self.subcategories.has_key(category):

@@ -126,8 +126,14 @@ class CreateCommand(CliCommand):
 
         self.parser.add_option("--category", dest="category", metavar="CATEGORY",
                 help="Parent category for album")
+        self.parser.add_option("--category-id", dest="categoryID", metavar="CATEGORYID",
+                help="Parent category (by ID number) for album")
         self.parser.add_option("--subcategory", dest="subcategory",
-                metavar="SUBCATEGORY", help="Parent category for album")
+                metavar="SUBCATEGORY",
+                help="Parent sub-category for album (must provide a category)")
+        self.parser.add_option("--subcategory-id", dest="subcategoryID",
+                metavar="SUBCATEGORYID",
+                help="Parent sub-category for album (must provide a category)")
         self.parser.add_option("--description", dest="description",
                 metavar="DESCRIPTION", help="Gallery description")
         self.parser.add_option("--keywords", dest="keywords",
